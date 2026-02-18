@@ -5,11 +5,9 @@ import pandas as pd
 from pathlib import Path
 
 class PreProcessData:
-    def __init__(self, import_dir, import_labels, export_dir):
+    def __init__(self, import_dir, export_dir):
         self.import_dir = Path(import_dir)
         self.export_dir = Path(export_dir)
-        self.df = pd.read_csv(import_labels)
-        self.labels = self.df['type'].to_numpy()
 
     def run(self):
         # Iterate through each folder in the import directory
@@ -58,9 +56,14 @@ class PreProcessData:
             np.savez(export_subdir / "volume.npz", volume=volume)
 
 if __name__ == "__main__":
-    app = PreProcessData(
+    exp1 = PreProcessData(
         import_dir="data/Experiment 1 - Blind",
-        import_labels="data/labels_exp1.csv",
         export_dir="data/export_exp1",
     )
-    app.run()
+    exp1.run()
+
+    exp2 = PreProcessData(
+        import_dir="data/Experiment 2 - Blind",
+        export_dir="data/export_exp2",
+    )
+    exp2.run()
