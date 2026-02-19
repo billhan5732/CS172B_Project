@@ -216,5 +216,6 @@ Tampered Scans/
 Results/
 *.dcm
 *.csv
-
 src/data/
+
+.DS_Store
