@@ -217,5 +217,8 @@ Results/
 *.dcm
 *.csv
 src/data/
+src/processed_dataset
+data
+processed_dataset
 
 .DS_Store
