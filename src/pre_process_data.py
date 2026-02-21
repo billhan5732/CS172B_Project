@@ -1,4 +1,3 @@
-from config import EXPORT_NPZ
 import pydicom
 import numpy as np
 import pandas as pd
