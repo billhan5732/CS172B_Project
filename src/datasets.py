@@ -12,17 +12,18 @@ VALID_CLASSES = {"FB", "FM", "TB", "TM"}
 CLASS_TO_IDX = {"FB": 0, "FM": 1, "TB": 2, "TM": 3}
 IDX_TO_CLASS = {0: "FB", 1: "FM", 2: "TB", 3: "TM"}
 
+
 # NOTE: Works for 2D CNN, maybe need to change around later to work with other approaches?
 # Custom dataset for extracting patches from CT scans
 class CTPatchDataset(Dataset):
     def __init__(
-        self, 
-        export_root: Path,
-        labels_csv: Path,
-        patch_size: int,
-        augment: bool,
-        jitter_px: int
-        ):
+            self,
+            export_root: Path,
+            labels_csv: Path,
+            patch_size: int,
+            augment: bool,
+            jitter_px: int
+    ):
 
         super().__init__()
 
@@ -35,8 +36,15 @@ class CTPatchDataset(Dataset):
         self._validate_config()
 
         self.df = pd.read_csv(self.labels_csv)
+        #self.df = pd.read_csv(self.labels_csv, header=None, names=["type", "uuid", "slice", "x", "y"])
 
-        # Cache so we don't constantly reload volume.npz
+        def volume_exists(uuid):
+            return (self.export_root / str(uuid) / "volume.npz").exists()
+
+        original_len = len(self.df)
+        self.df = self.df[self.df["uuid"].astype(str).apply(volume_exists)].reset_index(drop=True)
+        print(f"Loaded {len(self.df)}/{original_len} rows (missing volumes filtered out)")
+
         self._cache = dict()
 
     def __len__(self) -> int:
@@ -54,6 +62,8 @@ class CTPatchDataset(Dataset):
         x = int(row["x"])
         y = int(row["y"])
 
+
+
         # Validate label type
         if label_type not in CLASS_TO_IDX:
             raise ValueError(f"Invalid label type '{label_type}' at idx={idx}")
@@ -62,7 +72,8 @@ class CTPatchDataset(Dataset):
         volume_path = self.export_root / uuid / "volume.npz"
 
         if uuid not in self._cache:
-            self._cache[uuid] = np.load(volume_path, allow_pickle=False)["volume"] # Idk what allow_pickles does but gpt said to do it
+            self._cache[uuid] = np.load(volume_path, allow_pickle=False)[
+                "volume"]  # Idk what allow_pickles does but gpt said to do it
 
         volume = self._cache[uuid]
 
@@ -75,13 +86,19 @@ class CTPatchDataset(Dataset):
         # Get the specific slice of interest
         img = volume[scan_slice]
 
+        if x == 0 and y == 0:
+            # Randomly sample a patch location instead of using corner
+            half_patch = self.patch_size // 2
+            x = random.randint(half_patch, img.shape[1] - half_patch - 1)
+            y = random.randint(half_patch, img.shape[0] - half_patch - 1)
+
         # NOTE: Apply random jittering to the center coordinates during training
         if self.augment and self.jitter_px > 0:
             dx = random.randint(-self.jitter_px, self.jitter_px)
             dy = random.randint(-self.jitter_px, self.jitter_px)
             x += dx
             y += dy
-            
+
             # Just incase jitter makes our (x,y) go out of bounds
             x = max(0, min(x, img.shape[1] - 1))
             y = max(0, min(y, img.shape[0] - 1))
@@ -90,7 +107,7 @@ class CTPatchDataset(Dataset):
         patch = self.crop_center(img, x, y)
 
         # Need to convert to torch tensors to feed into CNN
-        patch = torch.from_numpy(patch).float().unsqueeze(0) # (1, patch_size, patch_size)
+        patch = torch.from_numpy(patch).float().unsqueeze(0)  # (1, patch_size, patch_size)
         label = torch.tensor(CLASS_TO_IDX[label_type], dtype=torch.long)
 
         return (patch, label)
@@ -107,18 +124,18 @@ class CTPatchDataset(Dataset):
 
         if self.jitter_px < 0:
             raise ValueError("jitter_px must be >= 0")
-    
+
     def crop_center(self, img: np.ndarray, x: int, y: int) -> np.ndarray:
         # Verify shape
         if img.ndim != 2:
             raise ValueError("img must be 2D")
-        
+
         # This should never occur but I'll add it anyways why not
         # Check bounds
         H, W = img.shape
         if not (0 <= x < W and 0 <= y < H):
             raise ValueError(f"(x,y)=({x},{y}) out of bounds for image shape {(H, W)}")
-        
+
         half_patch = self.patch_size // 2
 
         # Padding added to ensure we don't go out of bounds (i.e. if (x,y) is near edge of image)
@@ -130,14 +147,14 @@ class CTPatchDataset(Dataset):
         # NOTE: +1 added to odd patch_size upper_bound to ensure patch is true to patch_size
         if self.patch_size % 2 == 1:
             patch = padded[
-                y_pad-half_patch : y_pad+half_patch+1,
-                x_pad-half_patch : x_pad+half_patch+1
-            ]
+                    y_pad - half_patch: y_pad + half_patch + 1,
+                    x_pad - half_patch: x_pad + half_patch + 1
+                    ]
         else:
             patch = padded[
-                y_pad-half_patch : y_pad+half_patch,
-                x_pad-half_patch : x_pad+half_patch
-            ]
+                    y_pad - half_patch: y_pad + half_patch,
+                    x_pad - half_patch: x_pad + half_patch
+                    ]
 
         if patch.shape != (self.patch_size, self.patch_size):
             raise ValueError(f"Unexpected patch shape: {patch.shape}")
