@@ -66,7 +66,7 @@ if __name__ == "__main__":
     exp1.run()
 
     exp2 = PreProcessData(
-        import_dir="data/Experiment 2 - Blind",
+        import_dir="data/Experiment 2 - Open",
         export_dir="processed_dataset",
         uuid_prefix="exp2_",
     )
