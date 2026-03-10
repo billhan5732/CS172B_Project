@@ -495,3 +495,162 @@ class CTWholeScanDataset3D(Dataset):
             align_corners=False,
         )
         return tensor.squeeze(0).squeeze(0).numpy().astype(np.float32, copy=False)
+
+
+class CTCubeDataset3D(Dataset):
+    """Localized 3D cube dataset centered on `(slice, x, y)` annotations.
+
+    Each item returns:
+      x: (1, D, H, W) float32 cube
+      y: float32 scalar tensor in {0,1} when `binary=True`
+
+    This is intended for small-ROI 3D CNNs where a human or proposal stage can
+    provide a candidate centre point.
+    """
+
+    def __init__(
+        self,
+        export_root: Path,
+        labels_csv: Path,
+        cube_depth: int,
+        patch_size: int,
+        augment: bool,
+        jitter_xy: int = 0,
+        jitter_z: int = 0,
+        pad_mode: str = "edge",
+        volume_key: str = "volume",
+        binary: bool = True,
+    ):
+        super().__init__()
+
+        if cube_depth <= 0 or cube_depth % 2 == 0:
+            raise ValueError("cube_depth must be a positive odd integer")
+        if patch_size <= 0:
+            raise ValueError("patch_size must be positive")
+        if jitter_xy < 0 or jitter_z < 0:
+            raise ValueError("jitter_xy and jitter_z must be >= 0")
+        if pad_mode not in {"edge", "constant"}:
+            raise ValueError("pad_mode must be 'edge' or 'constant'")
+
+        self.export_root = Path(export_root)
+        self.labels_csv = Path(labels_csv)
+        self.cube_depth = int(cube_depth)
+        self.patch_size = int(patch_size)
+        self.augment = bool(augment)
+        self.jitter_xy = int(jitter_xy)
+        self.jitter_z = int(jitter_z)
+        self.pad_mode = pad_mode
+        self.volume_key = volume_key
+        self.binary = bool(binary)
+
+        if not self.labels_csv.exists():
+            raise FileNotFoundError(f"Labels CSV not found: {self.labels_csv}")
+        if not self.export_root.exists():
+            raise FileNotFoundError(f"Export root not found: {self.export_root}")
+
+        self.df = pd.read_csv(self.labels_csv).copy()
+        required_cols = {"uuid", "source", "slice", "x", "y"}
+        missing = required_cols - set(self.df.columns)
+        if missing:
+            raise ValueError(f"labels_csv missing required columns: {sorted(missing)}")
+
+        if self.binary and "target" not in self.df.columns:
+            raise ValueError("binary=True requires a 'target' column")
+        if (not self.binary) and "type" not in self.df.columns:
+            raise ValueError("binary=False requires a 'type' column")
+
+        self.df["uuid"] = self.df["uuid"].astype(str)
+        self.df["source"] = self.df["source"].astype(str)
+        self._cache: Dict[str, np.ndarray] = {}
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        row = self.df.iloc[idx]
+        source = str(row["source"])
+        uuid = str(row["uuid"])
+        volume_id = f"{source}_{uuid}"
+
+        z_center = int(row["slice"])
+        x = int(row["x"])
+        y = int(row["y"])
+
+        if self.binary:
+            label = torch.tensor(float(row["target"]), dtype=torch.float32)
+        else:
+            label_type = str(row["type"])
+            if label_type not in CLASS_TO_IDX:
+                raise ValueError(f"Invalid label type '{label_type}' at idx={idx}")
+            label = torch.tensor(CLASS_TO_IDX[label_type], dtype=torch.long)
+
+        volume_path = resolve_volume_path(self.export_root, uuid, source)
+        if volume_id not in self._cache:
+            self._cache[volume_id] = np.load(
+                volume_path,
+                mmap_mode="r",
+                allow_pickle=False,
+            )[self.volume_key]
+
+        volume = self._cache[volume_id]
+        Z, H, W = volume.shape
+
+        if self.augment and self.jitter_z > 0:
+            z_center += random.randint(-self.jitter_z, self.jitter_z)
+        if self.augment and self.jitter_xy > 0:
+            x += random.randint(-self.jitter_xy, self.jitter_xy)
+            y += random.randint(-self.jitter_xy, self.jitter_xy)
+
+        z_center = max(0, min(z_center, Z - 1))
+        x = max(0, min(x, W - 1))
+        y = max(0, min(y, H - 1))
+
+        half_depth = self.cube_depth // 2
+        if self.pad_mode == "edge":
+            z_indices = [max(0, min(Z - 1, z_center + dz)) for dz in range(-half_depth, half_depth + 1)]
+            imgs = [volume[z] for z in z_indices]
+        else:
+            imgs = []
+            for dz in range(-half_depth, half_depth + 1):
+                z = z_center + dz
+                if 0 <= z < Z:
+                    imgs.append(volume[z])
+                else:
+                    imgs.append(np.zeros((H, W), dtype=volume.dtype))
+
+        cube = np.stack([self._crop_2d_patch(img, x, y) for img in imgs], axis=0).astype(np.float32)
+        x_tensor = torch.from_numpy(cube).unsqueeze(0)  # (1, D, H, W)
+        return x_tensor, label
+
+    def _crop_2d_patch(self, img: np.ndarray, x: int, y: int) -> np.ndarray:
+        if img.ndim != 2:
+            raise ValueError("img must be 2D")
+
+        H, W = img.shape
+        if not (0 <= x < W and 0 <= y < H):
+            raise ValueError(f"(x,y)=({x},{y}) out of bounds for image shape {(H, W)}")
+
+        half_patch = self.patch_size // 2
+        if self.pad_mode == "edge":
+            padded = np.pad(img, pad_width=half_patch, mode="edge")
+        else:
+            padded = np.pad(img, pad_width=half_patch, mode="constant", constant_values=0)
+
+        x_pad = x + half_patch
+        y_pad = y + half_patch
+
+        if self.patch_size % 2 == 1:
+            patch = padded[
+                y_pad - half_patch : y_pad + half_patch + 1,
+                x_pad - half_patch : x_pad + half_patch + 1,
+            ]
+        else:
+            patch = padded[
+                y_pad - half_patch : y_pad + half_patch,
+                x_pad - half_patch : x_pad + half_patch,
+            ]
+
+        if patch.shape != (self.patch_size, self.patch_size):
+            raise ValueError(f"Unexpected patch shape: {patch.shape}")
+
+        return patch
