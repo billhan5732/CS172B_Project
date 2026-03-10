@@ -220,6 +220,7 @@ src/data/
 src/processed_dataset
 data
 processed_dataset
+3D_cnn_processed_dataset
 
 .DS_Store
 
