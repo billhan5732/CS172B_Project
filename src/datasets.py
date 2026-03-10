@@ -1,16 +1,38 @@
 import random
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 VALID_CLASSES = {"FB", "FM", "TB", "TM"}
 CLASS_TO_IDX = {"FB": 0, "FM": 1, "TB": 2, "TM": 3}
 IDX_TO_CLASS = {0: "FB", 1: "FM", 2: "TB", 3: "TM"}
+
+
+def resolve_volume_path(export_root: Path, uuid: str, source: Optional[str] = None) -> Path:
+    """Resolves a volume path under either <uuid>/volume.npz or <source>_<uuid>/volume.npz.
+
+    This supports the current mixed workspace state where some preprocessing runs
+    wrote unprefixed UUID folders while others use source-prefixed folder names.
+    """
+    export_root = Path(export_root)
+
+    candidates = []
+    if source:
+        candidates.append(export_root / f"{source}_{uuid}" / "volume.npz")
+    candidates.append(export_root / uuid / "volume.npz")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    searched = ", ".join(str(p) for p in candidates)
+    raise FileNotFoundError(f"Missing volume for uuid={uuid}, source={source}. Tried: {searched}")
 
 # NOTE: Works for 2D CNN, maybe need to change around later to work with other approaches?
 # Custom dataset for extracting patches from CT scans
@@ -59,7 +81,7 @@ class CTPatchDataset(Dataset):
             raise ValueError(f"Invalid label type '{label_type}' at idx={idx}")
 
         # Build path and get volume
-        volume_path = self.export_root / uuid / "volume.npz"
+        volume_path = resolve_volume_path(self.export_root, uuid)
 
         if uuid not in self._cache:
             self._cache[uuid] = np.load(volume_path, allow_pickle=False)["volume"] # Idk what allow_pickles does but gpt said to do it
@@ -233,11 +255,9 @@ class CTPatchDataset25D(Dataset):
             label = torch.tensor(CLASS_TO_IDX[label_type], dtype=torch.long)
 
         # Your volume path: processed_dataset/<source>_<uuid>/volume.npz
-        volume_path = self.export_root / volume_id / "volume.npz"
+        volume_path = resolve_volume_path(self.export_root, uuid, source)
 
         if volume_id not in self._cache:
-            if not volume_path.exists():
-                raise FileNotFoundError(f"Missing volume: {volume_path}")
             self._cache[volume_id] = np.load(
                 volume_path, mmap_mode="r", allow_pickle=False
             )[self.volume_key]
@@ -308,3 +328,170 @@ class CTPatchDataset25D(Dataset):
             raise ValueError(f"Unexpected patch shape: {patch.shape}")
 
         return patch
+
+
+class CTWholeScanDataset3D(Dataset):
+    """Whole-volume 3D CT dataset for scan-level binary classification.
+
+    Each item returns:
+      x: (1, D, H, W) float32
+      y: float32 scalar tensor in {0,1}
+
+    Expected CSV columns:
+      - `uuid`
+      - `source`
+      - `target`
+
+    Optional columns like `scan_id`, `type`, or shape metadata are preserved but
+    not required for loading.
+    """
+
+    def __init__(
+        self,
+        export_root: Path,
+        labels_csv: Path,
+        target_shape: Tuple[int, int, int],
+        augment: bool,
+        volume_key: str = "volume",
+        crop_threshold: float = 0.05,
+        crop_margin: int = 8,
+        intensity_jitter: float = 0.05,
+        noise_std: float = 0.01,
+    ):
+        super().__init__()
+
+        self.export_root = Path(export_root)
+        self.labels_csv = Path(labels_csv)
+        self.target_shape = tuple(int(v) for v in target_shape)
+        self.augment = bool(augment)
+        self.volume_key = volume_key
+        self.crop_threshold = float(crop_threshold)
+        self.crop_margin = int(crop_margin)
+        self.intensity_jitter = float(intensity_jitter)
+        self.noise_std = float(noise_std)
+
+        if len(self.target_shape) != 3 or min(self.target_shape) <= 0:
+            raise ValueError("target_shape must be a tuple of three positive ints")
+        if not self.labels_csv.exists():
+            raise FileNotFoundError(f"Labels CSV not found: {self.labels_csv}")
+        if not self.export_root.exists():
+            raise FileNotFoundError(f"Export root not found: {self.export_root}")
+
+        self.df = pd.read_csv(self.labels_csv).copy()
+        required_cols = {"uuid", "source", "target"}
+        missing = required_cols - set(self.df.columns)
+        if missing:
+            raise ValueError(f"labels_csv missing required columns: {sorted(missing)}")
+
+        self.df["uuid"] = self.df["uuid"].astype(str)
+        self.df["source"] = self.df["source"].astype(str)
+        self.df["scan_id"] = self.df.get(
+            "scan_id",
+            self.df["source"] + "_" + self.df["uuid"],
+        )
+
+        grouped = []
+        for (_, _), group in self.df.groupby(["source", "uuid"], sort=False):
+            targets = group["target"].dropna().astype(int).unique()
+            if len(targets) != 1:
+                raise ValueError(
+                    "Inconsistent binary targets within a scan: "
+                    f"source={group.iloc[0]['source']} uuid={group.iloc[0]['uuid']} targets={targets.tolist()}"
+                )
+            row = group.iloc[0].copy()
+            row["target"] = int(targets[0])
+            grouped.append(row)
+        self.scan_df = pd.DataFrame(grouped).reset_index(drop=True)
+
+        self._cache: Dict[str, np.ndarray] = {}
+
+    def __len__(self) -> int:
+        return len(self.scan_df)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        row = self.scan_df.iloc[idx]
+        uuid = str(row["uuid"])
+        source = str(row["source"])
+        scan_id = str(row["scan_id"])
+
+        if scan_id not in self._cache:
+            volume_path = resolve_volume_path(self.export_root, uuid, source)
+            self._cache[scan_id] = np.load(
+                volume_path,
+                mmap_mode="r",
+                allow_pickle=False,
+            )[self.volume_key]
+
+        volume = np.asarray(self._cache[scan_id], dtype=np.float32)
+        volume = self._crop_foreground(volume)
+        if self.augment:
+            volume = self._augment_volume(volume)
+        volume = self._resize_volume(volume)
+        volume = np.clip(volume, 0.0, 1.0)
+
+        x_tensor = torch.from_numpy(volume).unsqueeze(0)  # (1, D, H, W)
+        y_tensor = torch.tensor(float(row["target"]), dtype=torch.float32)
+        return x_tensor, y_tensor
+
+    def _crop_foreground(self, volume: np.ndarray) -> np.ndarray:
+        if volume.ndim != 3:
+            raise ValueError(f"Expected volume with shape (D,H,W), got {volume.shape}")
+
+        foreground = volume > self.crop_threshold
+        if not foreground.any():
+            return volume
+
+        z_idx = np.where(foreground.any(axis=(1, 2)))[0]
+        y_idx = np.where(foreground.any(axis=(0, 2)))[0]
+        x_idx = np.where(foreground.any(axis=(0, 1)))[0]
+
+        z0 = max(int(z_idx[0]) - self.crop_margin, 0)
+        z1 = min(int(z_idx[-1]) + self.crop_margin + 1, volume.shape[0])
+        y0 = max(int(y_idx[0]) - self.crop_margin, 0)
+        y1 = min(int(y_idx[-1]) + self.crop_margin + 1, volume.shape[1])
+        x0 = max(int(x_idx[0]) - self.crop_margin, 0)
+        x1 = min(int(x_idx[-1]) + self.crop_margin + 1, volume.shape[2])
+        return volume[z0:z1, y0:y1, x0:x1]
+
+    def _augment_volume(self, volume: np.ndarray) -> np.ndarray:
+        depth, height, width = volume.shape
+
+        if depth > 16:
+            max_shift_z = max(1, depth // 32)
+            shift_z = random.randint(-max_shift_z, max_shift_z)
+            if shift_z > 0:
+                volume = volume[shift_z:]
+            elif shift_z < 0:
+                volume = volume[:shift_z]
+
+        if height > 32 and width > 32:
+            max_trim_y = max(1, height // 40)
+            max_trim_x = max(1, width // 40)
+            trim_top = random.randint(0, max_trim_y)
+            trim_bottom = random.randint(0, max_trim_y)
+            trim_left = random.randint(0, max_trim_x)
+            trim_right = random.randint(0, max_trim_x)
+            volume = volume[
+                :,
+                trim_top:max(trim_top + 1, height - trim_bottom),
+                trim_left:max(trim_left + 1, width - trim_right),
+            ]
+
+        gain = 1.0 + random.uniform(-self.intensity_jitter, self.intensity_jitter)
+        bias = random.uniform(-self.intensity_jitter, self.intensity_jitter)
+        volume = volume * gain + bias
+
+        if self.noise_std > 0:
+            volume = volume + np.random.normal(0.0, self.noise_std, size=volume.shape).astype(np.float32)
+
+        return volume.astype(np.float32, copy=False)
+
+    def _resize_volume(self, volume: np.ndarray) -> np.ndarray:
+        tensor = torch.from_numpy(volume).unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
+        tensor = F.interpolate(
+            tensor,
+            size=self.target_shape,
+            mode="trilinear",
+            align_corners=False,
+        )
+        return tensor.squeeze(0).squeeze(0).numpy().astype(np.float32, copy=False)
